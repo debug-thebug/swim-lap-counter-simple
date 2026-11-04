@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Clap Lap Counter</title>
+<style>
+  /* Single dark look on purpose: pure black pixels are nearly free on OLED screens. */
+  :root {
+    --bg: #000;
+    --dim: #3a4a52;
+    --count: #6fa8bf;
+    --flash: #d8f3ff;
+    --line: #12191d;
+    --warn: #c98a4a;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--dim); font-family: var(--font); }
+  body {
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top, 0px) max(16px, env(safe-area-inset-right, 0px)) env(safe-area-inset-bottom, 0px) max(16px, env(safe-area-inset-left, 0px));
+    box-sizing: border-box; user-select: none; -webkit-user-select: none;
+  }
+  [hidden] { display: none !important; }
+  .top { display: flex; justify-content: space-between; align-items: center; padding-block: 14px; font-size: 13px; letter-spacing: .06em; text-transform: uppercase; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 8px; vertical-align: middle; }
+  .dot.live { background: #2f7a5a; }
+  main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; min-height: 0; }
+  #count { font-size: min(52vw, 46vh); line-height: 1; font-weight: 200; color: var(--count); font-variant-numeric: tabular-nums; transition: color .6s; }
+  #count.flash { color: var(--flash); transition: none; }
+  #sub { font-size: 15px; font-variant-numeric: tabular-nums; min-height: 1.4em; }
+  #meter { width: 60%; max-width: 280px; height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  #meterFill { height: 100%; width: 0; background: var(--dim); }
+  button {
+    font: inherit; color: var(--count); background: transparent; border: 1px solid var(--dim);
+    border-radius: 999px; padding: 14px 28px; font-size: 18px; cursor: pointer;
+  }
+  button:focus-visible { outline: 2px solid var(--count); outline-offset: 3px; }
+  button.small { font-size: 13px; padding: 8px 14px; color: var(--dim); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; padding-block: 16px; }
+  #start-screen { text-align: center; max-width: 34em; margin: 0 auto; line-height: 1.5; font-size: 15px; color: #8aa0aa; }
+  #start-screen h1 { color: var(--count); font-weight: 300; font-size: 28px; margin: 0 0 12px; }
+  #start-screen ol { text-align: left; padding-left: 1.2em; }
+  label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; text-align: left; margin-top: 14px; }
+  input[type=range] { width: 100%; }
+  #err { color: var(--warn); }
+  #splits { font-size: 13px; font-variant-numeric: tabular-nums; max-height: 22vh; overflow-y: auto; text-align: center; width: 100%; }
+</style>
+</head>
+<body>
+
+<section id="start-screen">
+  <div style="padding-block:24px">
+    <h1>Clap Lap Counter</h1>
+    <ol>
+      <li>Leave the phone by the pool, screen up, out of the splash zone.</li>
+      <li>Press Start once. The screen stays on and goes almost black.</li>
+      <li>Each time you finish a length, <b>clap twice, quickly</b>. You'll hear the count read out.</li>
+    </ol>
+    <label for="sens">Sensitivity <span id="sensVal"></span>
+      <input id="sens" type="range" min="1" max="10" value="5">
+    </label>
+    <label for="minLap">Shortest possible length: <span id="minLapVal"></span> s (anything faster is ignored)
+      <input id="minLap" type="range" min="5" max="90" step="5" value="15">
+    </label>
+    <div class="row"><button id="startBtn">Start</button></div>
+    <p id="err" hidden></p>
+  </div>
+</section>
+
+<section id="run" hidden style="display:flex;flex-direction:column;flex:1;min-height:0">
+  <div class="top"><span><span id="dot" class="dot"></span><span id="status">Listening</span></span><span id="clock">0:00</span></div>
+  <main>
+    <div id="count">0</div>
+    <div id="sub">Clap twice to count a length</div>
+    <div id="meter"><div id="meterFill"></div></div>
+    <div id="splits"></div>
+  </main>
+  <div class="row">
+    <button class="small" id="undoBtn">−1</button>
+    <button class="small" id="addBtn">+1</button>
+    <button class="small" id="stopBtn">Stop</button>
+  </div>
+</section>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sens = $('sens'), minLap = $('minLap');
+  const saved = (() => { try { return JSON.parse(localStorage.getItem('clapLapSettings') || '{}'); } catch { return {}; } })();
+  if (saved.sens) sens.value = saved.sens;
+  if (saved.minLap) minLap.value = saved.minLap;
+  const showSettings = () => { $('sensVal').textContent = sens.value; $('minLapVal').textContent = minLap.value; };
+  sens.oninput = minLap.oninput = () => {
+    showSettings();
+    try { localStorage.setItem('clapLapSettings', JSON.stringify({ sens: sens.value, minLap: minLap.value })); } catch {}
+  };
+  showSettings();
+
+  let ctx, stream, analyser, buf, timer, wakeLock;
+  let laps = [], startTime = 0, lastLapAt = 0;
+  // clap detector state
+  let floor = 0.01, armed = true, onsets = [], muteUntil = 0;
+
+  const fmt = ms => { const s = Math.floor(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+
+  function speak(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.05;
+      muteUntil = performance.now() + 2500; // don't hear our own voice as claps
+      u.onend = () => { muteUntil = performance.now() + 300; };
+      speechSynthesis.speak(u);
+    } catch {}
+  }
+
+  function render() {
+    $('count').textContent = laps.length;
+    const rows = [];
+    for (let i = laps.length - 1; i >= Math.max(0, laps.length - 6); i--) {
+      const prev = i === 0 ? startTime : laps[i - 1];
+      rows.push('Length ' + (i + 1) + ' · ' + fmt(laps[i] - prev));
+    }
+    $('splits').innerHTML = rows.join('<br>');
+  }
+
+  function countLap(viaClap) {
+    const now = Date.now();
+    if (viaClap && now - lastLapAt < minLap.value * 1000) {
+      $('sub').textContent = 'Ignored: too soon after the last length';
+      return;
+    }
+    laps.push(now); lastLapAt = now;
+    render();
+    const c = $('count'); c.classList.add('flash'); setTimeout(() => c.classList.remove('flash'), 120);
+    $('sub').textContent = 'Last length ' + fmt(now - (laps.length > 1 ? laps[laps.length - 2] : startTime));
+    speak(String(laps.length));
+    try { navigator.vibrate && navigator.vibrate(80); } catch {}
+  }
+
+  // ~every 25 ms: look at the loudest sample in the last ~21 ms of audio.
+  function tick() {
+    analyser.getFloatTimeDomainData(buf);
+    let peak = 0;
+    for (let i = 0; i < buf.length; i++) { const v = Math.abs(buf[i]); if (v > peak) peak = v; }
+    const t = performance.now();
+
+    // sensitivity 1..10 -> needs to be 12x..3x louder than the background
+    const ratio = 13 - sens.value;
+    const thresh = Math.max(0.06, floor * ratio);
+    $('meterFill').style.width = Math.min(100, peak / thresh * 100) + '%';
+
+    if (peak < thresh * 0.4) {
+      armed = true; // back to quiet, so the next spike is a fresh sound
+      floor = floor * 0.97 + peak * 0.03;
+    }
+    if (t < muteUntil) return;
+
+    if (armed && peak > thresh) {
+      armed = false;
+      onsets.push(t);
+    }
+    // a clap pair = exactly 2 sharp sounds, 120-750 ms apart, then quiet for 600 ms
+    onsets = onsets.filter(o => t - o < 1600);
+    if (onsets.length && t - onsets[onsets.length - 1] > 600) {
+      if (onsets.length === 2) {
+        const gap = onsets[1] - onsets[0];
+        if (gap > 120 && gap < 750) countLap(true);
+      }
+      onsets = [];
+    }
+  }
+
+  async function keepAwake() {
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && stream) {
+      keepAwake();
+      if (ctx && ctx.state === 'suspended') ctx.resume();
+      $('status').textContent = 'Listening';
+    }
+  });
+
+  $('startBtn').onclick = async () => {
+    $('err').hidden = true;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+    } catch (e) {
+      $('err').textContent = 'Microphone access was blocked. Allow the mic for this page in your browser settings, then press Start again. (' + e.name + ')';
+      $('err').hidden = false;
+      return;
+    }
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    buf = new Float32Array(analyser.fftSize);
+    src.connect(analyser);
+
+    laps = []; startTime = Date.now(); lastLapAt = 0; onsets = [];
+    render();
+    $('start-screen').hidden = true;
+    $('run').hidden = false;
+    $('dot').classList.add('live');
+    speak('Ready');
+    await keepAwake();
+    timer = setInterval(tick, 25);
+    setInterval(() => { if (startTime) $('clock').textContent = fmt(Date.now() - startTime); }, 1000);
+  };
+
+  $('undoBtn').onclick = () => { laps.pop(); lastLapAt = laps.length ? laps[laps.length - 1] : 0; render(); speak(String(laps.length)); };
+  $('addBtn').onclick = () => countLap(false);
+  $('stopBtn').onclick = () => {
+    clearInterval(timer);
+    stream && stream.getTracks().forEach(t => t.stop());
+    ctx && ctx.close();
+    try { wakeLock && wakeLock.release(); } catch {}
+    stream = null;
+    $('dot').classList.remove('live');
+    $('status').textContent = 'Stopped';
+    $('sub').textContent = laps.length + ' lengths in ' + fmt(Date.now() - startTime);
+    speak(laps.length + ' lengths');
+    startTime = 0;
+    $('stopBtn').textContent = 'New session';
+    $('stopBtn').onclick = () => location.reload();
+  };
+})();
+</script>
+</body>
+</html>
