@@ -45,6 +45,7 @@
   #start-screen ol { text-align: left; padding-left: 1.2em; }
   label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; text-align: left; margin-top: 14px; }
   input[type=range] { width: 100%; }
+  select { font: inherit; font-size: 15px; background: #0b1013; color: #8aa0aa; border: 1px solid var(--dim); border-radius: 8px; padding: 8px; }
   #err { color: var(--warn); }
   #splits { font-size: 13px; font-variant-numeric: tabular-nums; max-height: 22vh; overflow-y: auto; text-align: center; width: 100%; }
 </style>
@@ -57,13 +58,20 @@
     <ol>
       <li>Leave the phone by the pool, screen up, out of the splash zone.</li>
       <li>Press Start once. The screen stays on and goes almost black.</li>
-      <li>Each time you finish a length, <b>clap twice, quickly</b>. You'll hear the count read out.</li>
+      <li>Each time you finish a length, <b>clap twice, quickly</b>. Normal claps are enough. You'll hear a beep.</li>
     </ol>
     <label for="sens">Sensitivity <span id="sensVal"></span>
-      <input id="sens" type="range" min="1" max="10" value="5">
+      <input id="sens" type="range" min="1" max="10" value="6">
     </label>
     <label for="minLap">Shortest possible length: <span id="minLapVal"></span> s (anything faster is ignored)
       <input id="minLap" type="range" min="5" max="90" step="5" value="15">
+    </label>
+    <label for="fb">When a length is counted
+      <select id="fb">
+        <option value="beep">Beep (plays over your music)</option>
+        <option value="voice">Say the number (may pause music)</option>
+        <option value="none">Silent</option>
+      </select>
     </label>
     <div class="row"><button id="startBtn">Start</button></div>
     <p id="err" hidden></p>
@@ -88,23 +96,41 @@
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const sens = $('sens'), minLap = $('minLap');
-  const saved = (() => { try { return JSON.parse(localStorage.getItem('clapLapSettings') || '{}'); } catch { return {}; } })();
+  const sens = $('sens'), minLap = $('minLap'), fb = $('fb');
+  const saved = (() => { try { return JSON.parse(localStorage.getItem('clapLapSettings2') || '{}'); } catch { return {}; } })();
   if (saved.sens) sens.value = saved.sens;
   if (saved.minLap) minLap.value = saved.minLap;
+  if (saved.fb) fb.value = saved.fb;
   const showSettings = () => { $('sensVal').textContent = sens.value; $('minLapVal').textContent = minLap.value; };
-  sens.oninput = minLap.oninput = () => {
+  sens.oninput = minLap.oninput = fb.onchange = () => {
     showSettings();
-    try { localStorage.setItem('clapLapSettings', JSON.stringify({ sens: sens.value, minLap: minLap.value })); } catch {}
+    try { localStorage.setItem('clapLapSettings2', JSON.stringify({ sens: sens.value, minLap: minLap.value, fb: fb.value })); } catch {}
   };
   showSettings();
 
-  let ctx, stream, analyser, buf, timer, wakeLock;
+  let ctx, stream, analyser, buf, timer, clockTimer, wakeLock;
   let laps = [], startTime = 0, lastLapAt = 0;
   // clap detector state
-  let floor = 0.01, armed = true, onsets = [], muteUntil = 0;
+  const hist = []; let armed = true, onsets = [], muteUntil = 0, prevPeak = 0;
 
   const fmt = ms => { const s = Math.floor(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+
+  // Short tone through Web Audio: mixes with music instead of taking it over.
+  function beep(freqs) {
+    if (!ctx) return;
+    let t = ctx.currentTime + 0.02;
+    for (const f of freqs) {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.frequency.value = f; o.type = 'sine';
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.35, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t); o.stop(t + 0.18);
+      t += 0.2;
+    }
+    muteUntil = performance.now() + 250 + freqs.length * 200; // ignore our own beep
+  }
 
   function speak(text) {
     try {
@@ -112,10 +138,18 @@
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.rate = 1.05;
-      muteUntil = performance.now() + 2500; // don't hear our own voice as claps
+      muteUntil = performance.now() + 2500;
       u.onend = () => { muteUntil = performance.now() + 300; };
       speechSynthesis.speak(u);
     } catch {}
+  }
+
+  function announce(n, kind) {
+    if (fb.value === 'voice') { speak(kind === 'undo' ? 'Back to ' + n : String(n)); return; }
+    if (fb.value === 'none') return;
+    if (kind === 'undo') beep([440]);
+    else if (n % 10 === 0) beep([880, 880, 1175]); // every 10th length: three beeps
+    else beep([880, 1175]);
   }
 
   function render() {
@@ -138,38 +172,43 @@
     render();
     const c = $('count'); c.classList.add('flash'); setTimeout(() => c.classList.remove('flash'), 120);
     $('sub').textContent = 'Last length ' + fmt(now - (laps.length > 1 ? laps[laps.length - 2] : startTime));
-    speak(String(laps.length));
-    try { navigator.vibrate && navigator.vibrate(80); } catch {}
+    announce(laps.length, 'lap');
   }
 
-  // ~every 25 ms: look at the loudest sample in the last ~21 ms of audio.
+  // Every 20 ms: loudest sample of the last ~21 ms, after a high-pass filter.
+  // Claps are sharp and full of high frequencies; music and pool noise are steadier,
+  // so a clap is "much louder than the last second's typical level, and sudden".
   function tick() {
     analyser.getFloatTimeDomainData(buf);
     let peak = 0;
     for (let i = 0; i < buf.length; i++) { const v = Math.abs(buf[i]); if (v > peak) peak = v; }
     const t = performance.now();
 
-    // sensitivity 1..10 -> needs to be 12x..3x louder than the background
-    const ratio = 13 - sens.value;
-    const thresh = Math.max(0.06, floor * ratio);
+    hist.push(peak); if (hist.length > 50) hist.shift();
+    const sorted = hist.slice().sort((a, b) => a - b);
+    const bg = sorted[Math.floor(sorted.length * 0.5)] || 0;    // typical level over ~1 s
+    const beats = sorted[Math.floor(sorted.length * 0.92)] || 0; // loudest regular sounds (drums, splashes)
+
+    // sensitivity 1..10 -> clap must be ~8.4x .. 2.5x the typical level, and well above the beats
+    const ratio = 9 - sens.value * 0.65;
+    const thresh = Math.max(0.008, bg * ratio, beats * (2.2 - sens.value * 0.1));
     $('meterFill').style.width = Math.min(100, peak / thresh * 100) + '%';
 
-    if (peak < thresh * 0.4) {
-      armed = true; // back to quiet, so the next spike is a fresh sound
-      floor = floor * 0.97 + peak * 0.03;
-    }
+    if (peak < thresh * 0.5) armed = true;
+    const sudden = peak > prevPeak * 1.8;
+    prevPeak = peak;
     if (t < muteUntil) return;
 
-    if (armed && peak > thresh) {
+    if (armed && sudden && peak > thresh) {
       armed = false;
       onsets.push(t);
     }
-    // a clap pair = exactly 2 sharp sounds, 120-750 ms apart, then quiet for 600 ms
+    // a clap pair = exactly 2 sharp sounds, 100-750 ms apart, then nothing for 600 ms
     onsets = onsets.filter(o => t - o < 1600);
     if (onsets.length && t - onsets[onsets.length - 1] > 600) {
       if (onsets.length === 2) {
         const gap = onsets[1] - onsets[0];
-        if (gap > 120 && gap < 750) countLap(true);
+        if (gap > 100 && gap < 750) countLap(true);
       }
       onsets = [];
     }
@@ -190,8 +229,9 @@
   $('startBtn').onclick = async () => {
     $('err').hidden = true;
     try {
+      // All voice-call processing off: it squashes claps and makes phones duck music.
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
       });
     } catch (e) {
       $('err').textContent = 'Microphone access was blocked. Allow the mic for this page in your browser settings, then press Start again. (' + e.name + ')';
@@ -200,34 +240,36 @@
     }
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     const src = ctx.createMediaStreamSource(stream);
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 1800; hp.Q.value = 0.7;
     analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     buf = new Float32Array(analyser.fftSize);
-    src.connect(analyser);
+    src.connect(hp); hp.connect(analyser);
 
-    laps = []; startTime = Date.now(); lastLapAt = 0; onsets = [];
+    laps = []; startTime = Date.now(); lastLapAt = 0; onsets = []; hist.length = 0;
     render();
     $('start-screen').hidden = true;
     $('run').hidden = false;
     $('dot').classList.add('live');
-    speak('Ready');
+    if (fb.value === 'voice') speak('Ready'); else if (fb.value === 'beep') beep([660]);
     await keepAwake();
-    timer = setInterval(tick, 25);
-    setInterval(() => { if (startTime) $('clock').textContent = fmt(Date.now() - startTime); }, 1000);
+    timer = setInterval(tick, 20);
+    clockTimer = setInterval(() => { if (startTime) $('clock').textContent = fmt(Date.now() - startTime); }, 1000);
   };
 
-  $('undoBtn').onclick = () => { laps.pop(); lastLapAt = laps.length ? laps[laps.length - 1] : 0; render(); speak(String(laps.length)); };
+  $('undoBtn').onclick = () => { laps.pop(); lastLapAt = laps.length ? laps[laps.length - 1] : 0; render(); announce(laps.length, 'undo'); };
   $('addBtn').onclick = () => countLap(false);
   $('stopBtn').onclick = () => {
-    clearInterval(timer);
+    clearInterval(timer); clearInterval(clockTimer);
+    if (fb.value === 'voice') speak(laps.length + ' lengths');
     stream && stream.getTracks().forEach(t => t.stop());
-    ctx && ctx.close();
+    setTimeout(() => ctx && ctx.close(), 3000);
     try { wakeLock && wakeLock.release(); } catch {}
     stream = null;
     $('dot').classList.remove('live');
     $('status').textContent = 'Stopped';
     $('sub').textContent = laps.length + ' lengths in ' + fmt(Date.now() - startTime);
-    speak(laps.length + ' lengths');
     startTime = 0;
     $('stopBtn').textContent = 'New session';
     $('stopBtn').onclick = () => location.reload();
